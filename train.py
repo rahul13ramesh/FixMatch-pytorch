@@ -14,8 +14,6 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 
 from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
@@ -27,9 +25,6 @@ best_acc = 0
 def save_checkpoint(state, is_best, checkpoint, filename='checkpoint.pth.tar'):
     filepath = os.path.join(checkpoint, filename)
     torch.save(state, filepath)
-    if is_best:
-        shutil.copyfile(filepath, os.path.join(checkpoint,
-                                               'model_best.pth.tar'))
 
 
 def set_seed(args):
@@ -111,9 +106,7 @@ def main():
                         help='pseudo label threshold')
     parser.add_argument('--out', default='result',
                         help='directory to output the result')
-    parser.add_argument('--resume', default='', type=str,
-                        help='path to latest checkpoint (default: none)')
-    parser.add_argument('--seed', default=None, type=int,
+    parser.add_argument('--seed', default=0, type=int,
                         help="random seed")
     parser.add_argument("--amp", action="store_true",
                         help="use 16-bit (mixed) precision through NVIDIA apex AMP")
@@ -128,6 +121,8 @@ def main():
     args = parser.parse_args()
     global best_acc
 
+    args.out = args.out + "_" + str(args.seed)
+
     def create_model(args):
         if args.arch == 'wideresnet':
             import models.wideresnet as models
@@ -135,12 +130,8 @@ def main():
                                             widen_factor=args.model_width,
                                             dropout=0,
                                             num_classes=args.num_classes)
-        elif args.arch == 'resnext':
-            import models.resnext as models
-            model = models.build_resnext(cardinality=args.model_cardinality,
-                                         depth=args.model_depth,
-                                         width=args.model_width,
-                                         num_classes=args.num_classes)
+        else:
+            raise NotImplementedError
         logger.info("Total params: {:.2f}M".format(
             sum(p.numel() for p in model.parameters())/1e6))
         return model
@@ -159,7 +150,7 @@ def main():
     args.device = device
 
     logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        format="%(asctime)s -  %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
 
@@ -177,7 +168,6 @@ def main():
 
     if args.local_rank in [-1, 0]:
         os.makedirs(args.out, exist_ok=True)
-        args.writer = SummaryWriter(args.out)
 
     if args.dataset == 'cifar10':
         args.num_classes = 10
@@ -260,20 +250,6 @@ def main():
 
     args.start_epoch = 0
 
-    if args.resume:
-        logger.info("==> Resuming from checkpoint..")
-        assert os.path.isfile(
-            args.resume), "Error: no checkpoint directory found!"
-        args.out = os.path.dirname(args.resume)
-        checkpoint = torch.load(args.resume)
-        best_acc = checkpoint['best_acc']
-        args.start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        if args.use_ema:
-            ema_model.ema.load_state_dict(checkpoint['ema_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-
     if args.amp:
         from apex import amp
         model, optimizer = amp.initialize(
@@ -322,10 +298,22 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         losses_x = AverageMeter()
         losses_u = AverageMeter()
         mask_probs = AverageMeter()
-        if not args.no_progress:
-            p_bar = tqdm(range(args.eval_step),
-                         disable=args.local_rank not in [-1, 0])
         for batch_idx in range(args.eval_step):
+
+            if (batch_idx % 200 == 199 and epoch < 5) or (epoch == 0 and batch_idx == 0):
+                logger.info(" Saving model at (%d, %d)" % (epoch, batch_idx))
+                model_to_save = model.module if hasattr(model, "module") else model
+                if args.use_ema:
+                    ema_to_save = ema_model.ema.module if hasattr(
+                        ema_model.ema, "module") else ema_model.ema
+                model_name = "model_" + str(epoch) + "_" + str(batch_idx) + ".pth"
+                save_checkpoint({
+                    'epoch': epoch,
+                    'batch': batch_idx,
+                    'state_dict': model_to_save.state_dict(),
+                    'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
+                }, False, args.out, model_name)
+
             try:
                 inputs_x, targets_x = labeled_iter.next()
             except:
@@ -384,23 +372,6 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             batch_time.update(time.time() - end)
             end = time.time()
             mask_probs.update(mask.mean().item())
-            if not args.no_progress:
-                p_bar.set_description("Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
-                    epoch=epoch + 1,
-                    epochs=args.epochs,
-                    batch=batch_idx + 1,
-                    iter=args.eval_step,
-                    lr=scheduler.get_last_lr()[0],
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    loss=losses.avg,
-                    loss_x=losses_x.avg,
-                    loss_u=losses_u.avg,
-                    mask=mask_probs.avg))
-                p_bar.update()
-
-        if not args.no_progress:
-            p_bar.close()
 
         if args.use_ema:
             test_model = ema_model.ema
@@ -410,13 +381,6 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
         if args.local_rank in [-1, 0]:
             test_loss, test_acc = test(args, test_loader, test_model, epoch)
 
-            args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
-            args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
-            args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
-            args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
-            args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
-            args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
-
             is_best = test_acc > best_acc
             best_acc = max(test_acc, best_acc)
 
@@ -424,23 +388,20 @@ def train(args, labeled_trainloader, unlabeled_trainloader, test_loader,
             if args.use_ema:
                 ema_to_save = ema_model.ema.module if hasattr(
                     ema_model.ema, "module") else ema_model.ema
+
+            model_name = "model_" + str(epoch) + "_" + str(0) + ".pth"
             save_checkpoint({
                 'epoch': epoch + 1,
+                'batch_idx': 0,
                 'state_dict': model_to_save.state_dict(),
                 'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
                 'acc': test_acc,
-                'best_acc': best_acc,
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-            }, is_best, args.out)
+            }, is_best, args.out, model_name)
 
             test_accs.append(test_acc)
             logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
             logger.info('Mean top-1 acc: {:.2f}\n'.format(
                 np.mean(test_accs[-20:])))
-
-    if args.local_rank in [-1, 0]:
-        args.writer.close()
 
 
 def test(args, test_loader, model, epoch):
@@ -450,10 +411,6 @@ def test(args, test_loader, model, epoch):
     top1 = AverageMeter()
     top5 = AverageMeter()
     end = time.time()
-
-    if not args.no_progress:
-        test_loader = tqdm(test_loader,
-                           disable=args.local_rank not in [-1, 0])
 
     with torch.no_grad():
         for batch_idx, (inputs, targets) in enumerate(test_loader):
@@ -471,18 +428,6 @@ def test(args, test_loader, model, epoch):
             top5.update(prec5.item(), inputs.shape[0])
             batch_time.update(time.time() - end)
             end = time.time()
-            if not args.no_progress:
-                test_loader.set_description("Test Iter: {batch:4}/{iter:4}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. top1: {top1:.2f}. top5: {top5:.2f}. ".format(
-                    batch=batch_idx + 1,
-                    iter=len(test_loader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    loss=losses.avg,
-                    top1=top1.avg,
-                    top5=top5.avg,
-                ))
-        if not args.no_progress:
-            test_loader.close()
 
     logger.info("top-1 acc: {:.2f}".format(top1.avg))
     logger.info("top-5 acc: {:.2f}".format(top5.avg))
